@@ -1,0 +1,202 @@
+#!/usr/bin/env python
+
+import rospy, math, utils, image_geometry, tf, operator
+import tf.transformations as tf_help
+import numpy as np
+from sensor_msgs import point_cloud2 as pc2
+from sensor_msgs.msg import Image, CompressedImage, PointCloud2, CameraInfo, PointField
+from rospy.numpy_msg import numpy_msg
+from rospy_tutorials.msg import Floats
+import sys
+
+NS = 'object_detector'
+NODE_NAME = 'semseg_to_pcl'
+PARAM_PREFIX = NS + '/' + NODE_NAME + '/'
+
+PARAM_LIST = [	('in_pcl', 'dynamic_point_cloud'),
+		('out_pcl', 'dynamic_point_cloud_clmat'),
+		('in_viz', 'viz'),
+		('in_semseg','semseg'),
+		('max_clmat_age', 15),
+		('max_pcl_age', 15),
+		('transform_wait', 0.2),
+		('base_frame', 'odom'),
+		('map_frame', 'map'),
+		('camera_frame', 'omnicam'),
+		('default_thermo', -200),
+		('image_rate', 5),
+		('camera_used','camera_0')]
+
+class ToPCL:
+	def __init__(self):
+		rospy.init_node(NODE_NAME)
+		sys.path.append('~/Documents/RobotSemantics/semseg_ws/src/image_segnet/object_class_pcl/src')		
+		for name, default in PARAM_LIST:
+			setattr(self, name, rospy.get_param(PARAM_PREFIX + name, default))
+
+		rospy.Subscriber(self.in_pcl, PointCloud2, self.pcl_cb)
+		rospy.Subscriber(self.in_viz + '/'+self.camera_used+'/camera_info', CameraInfo, self.ci_cb)
+		rospy.Subscriber(self.in_viz + '/'+self.camera_used+'/image/compressed', CompressedImage , self.image_cb)
+		rospy.Subscriber(self.in_semseg + '/class_matrix', numpy_msg(Floats), self.clmat_cb)
+		self.pcl_pub = rospy.Publisher(self.out_pcl, PointCloud2, queue_size=20)
+		self.clmats = {}
+		self.cis = {}
+		self.imgsC = {}
+		self.timestamps = []
+		self.counterTS = 0
+		self.counter = 0
+		#SHOULD BE CHANGED TO SOMETHING ADAPTIVE - NOW manually SETTED	
+		self.camera0PM = [638.81494, 0, 625.98561, 0, 0, 585.79797, 748.57858, 0, 0, 0, 1, 0];
+		self.tf_listener = tf.TransformListener()
+		self.adjustment = np.dot(tf_help.rotation_matrix(math.pi/2, (0,1,0)), tf_help.rotation_matrix(math.pi, (0,0,1)))
+
+	def pcl_cb(self, pcl):
+		if len(pcl.data) is 0:
+			rospy.logwarn('No points')
+			return
+		if len(self.clmats) == 0:
+			rospy.logwarn('There are not any segmented images!')
+			return
+		if (rospy.Time.now() - pcl.header.stamp).to_sec() > self.max_pcl_age:
+			rospy.logwarn('Too old pointcloud! Skipping!')
+			return
+		cloud = list(pc2.read_points(pcl, skip_nans=True))
+		np_cloud = utils.cloud_to_numpy(cloud)
+		transforms = {}
+		use_clmat = self.clmats.copy()#class matrix - clmats[tt] = vector dat z class matrix (360x480), tt - time stamp of class matrix
+		print use_clmat
+		keys = sorted(use_clmat.keys(), reverse=True)#sort list of cl matrices
+		print 'Keys are'
+		print keys
+		use_ci = self.cis.copy()#camera info
+		clmat_data = np.zeros((np_cloud.shape[0],)) #zero matrix same size as np_cloud + self.default_thermo
+		for key in keys:#for each timestamp
+			print key
+			#print use_ci
+			if key not in use_ci:#if we don't have use_ci in timestamps
+				rospy.logwarn("Don't have camera info yet for image with stamp " + str(key))
+#				continue
+#			try:	
+				self.tf_listener.waitForTransformFull(self.camera_frame, pcl.header.stamp, pcl.header.frame_id, pcl.header.stamp, self.base_frame, rospy.Duration(self.transform_wait))				
+				transforms[key] = self.tf_listener.fromTranslationRotation(*self.tf_listener.lookupTransformFull(self.camera_frame, pcl.header.stamp, pcl.header.frame_id, pcl.header.stamp, self.base_frame))
+#			except tf.Exception as exc:
+#				print "hi"
+#				rospy.logwarn(exc)
+#				break
+		for key in transforms:
+#			rospy.loginfo('Key is %s' % (key)) cis
+			cam_cloud = np.dot(transforms[key], np_cloud.T).T
+			cam_cloud = cam_cloud.dot(self.adjustment.T)
+			cam_valid = np.where(cam_cloud[:,2] >= 0)[0]
+			cam_data = cam_cloud[cam_valid]
+			cam_data = cam_data.reshape((np.product(cam_data.shape)/4, 4))
+			print 'cam_data'
+			print cam_data
+			#SHOULD BE ADAPTIVE
+			#should be transformed to the original image size - here is the size of segmented image after segnet
+			print np.array(use_clmat[key].data)
+			width = 360#use_clmat[key].width 1232
+			height = 480#use_clmat[key].height 1616
+			#print use_ci[key-min(key - np.array(self.timestamps))]
+			cam_mat = np.array(use_ci[key-min(key - np.array(self.timestamps))].P).reshape((3,4))
+			print 'cam_mat:'			
+			print cam_mat
+			#cam_mat = np.array(self.camera0PM).reshape((3,4))#projection matrix pasted in a hard way (should read adaptively from camera info, but timestamps didn't match) 
+			cam_data = cam_mat.dot(cam_data.T).T
+			div = cam_data[:,2]
+			x = np.round(cam_data[:,0]/div)
+			y = np.round(cam_data[:,1]/div)
+
+			pix_x = np.where((0 <= x) & (x < width))[0]
+			pix_y = np.where((0 <= y) & (y < height))[0]
+
+			pix_valid = np.intersect1d(pix_x, pix_y)
+			pix_coords = np.c_[x[pix_valid], y[pix_valid]]
+			valid = cam_valid[pix_valid]
+
+			coords = np.rint(pix_coords).astype(int)
+			ind = coords.dot(np.array([1, width]).reshape((2,1)))
+			#print "ind:"
+			#print ind
+			th_data = np.array(use_clmat[key])
+			clmat_data[valid.T] = th_data[ind]
+			print "th_data:"
+			print th_data
+			all_valid = np.where(clmat_data == 0)[0]
+			rospy.loginfo('Found temperature for %d points out of %d' % (all_valid.size, clmat_data.size))
+			for cl_id in range(10):
+				all_valid = np.where(clmat_data == cl_id)[0]
+				rospy.loginfo('For class %d found temperature for %d points out of %d' % (cl_id, all_valid.size, clmat_data.size))
+		all_valid = np.where(clmat_data > 0)[0]		
+		if all_valid.size is not 0:
+			clmat_field = PointField(name='clmat', offset=(pcl.fields[-1].offset + 4), datatype=PointField.FLOAT32, count=1)
+			rgb, x, y, z, i = zip(*cloud)
+			iterize = lambda x : x if hasattr(x, '__len__') else [x]
+            		get_fun = operator.itemgetter(*(all_valid.tolist()))
+            		x = iterize(get_fun(x))
+            		y = iterize(get_fun(y))
+            		z = iterize(get_fun(z))
+            		points = np.array(zip(x, y, z, np.ones(np.shape(x))))
+            		try:
+                		self.tf_listener.waitForTransform(self.map_frame, pcl.header.frame_id, pcl.header.stamp, rospy.Duration(self.transform_wait))
+                		transform = self.tf_listener.fromTranslationRotation(*self.tf_listener.lookupTransform(self.map_frame, pcl.header.frame_id, pcl.header.stamp))
+            		except tf.Exception as exc:
+                		rospy.logwarn(exc)
+                		return
+            		points = np.dot(transform, points.T).T
+            		x, y, z, w = zip(*points)
+			print 'all_valid.size:'
+			print all_valid.size
+			clmat = clmat_data[all_valid]
+			rgb = clmat_to_rgb(clmat)
+			#clcloud = cloud[all_valid]
+			#print clcloud
+			data = zip(rgb, x, y, z, i, clmat)
+			msg = pc2.create_cloud(pcl.header, pcl.fields + [clmat_field], data)
+			self.pcl_pub.publish(msg)
+			#data = zip(x, y, z, thermo)
+                	#fpcl = pc2.create_cloud(pcl.header, pcl.fields[1:4] + [thermo_field], data)
+                	#annMsg = AnnotatedPCL()
+                	#annMsg.pcl = fpcl
+                	#annMsg.ann = "fire"
+                	#id = self.collection.put(annMsg)
+
+	def ci_cb(self, ci):
+		self.cis[ci.header.stamp] = ci	
+		self.timestamps.append(ci.header.stamp)
+#		self.counterTS += 1	
+		#self.rm_old(self.cis)
+
+	def rm_old(self, data):#remove old images
+		now = rospy.Time.now()
+		rm = [key for key in data if (float(str(now)) - float(str(key)))/10000000000 > self.max_clmat_age]
+		for key in rm:
+			del data[key]
+
+	def image_cb(self, image):#saves coming images
+		if self.counter is 0:
+			self.imgsC[image.header.stamp] = image
+			self.rm_old(self.imgsC)
+		self.counter += 1
+		self.counter %= self.image_rate
+
+	def clmat_cb(self, data):#saves coming class matrices
+		print "hi"
+		if self.counter is 0:
+			tt = rospy.Time((data.data[0]/1000000000))
+			self.clmats[tt] = data.data[1:data.data.shape[0]]
+			#self.rm_old(self.clmats)
+			print "hi"
+		self.counter += 1
+		self.counter %= self.image_rate
+		
+def clmat_to_rgb(clmat):
+	min_clmat = np.min(clmat)
+	max_clmat = np.max(clmat)
+	rospy.loginfo('Min and max temperature: %.2f, %.2f' % (min_clmat, max_clmat))
+	scaled = ((clmat - min_clmat)/(max_clmat - min_clmat))
+	print scaled
+	z = np.zeros(clmat.shape)
+	o = np.ones(clmat.shape)
+	r = np.minimum(np.maximum(z, 1.5 - abs(1 - 4*(scaled-0.5))),o)
+	g 
